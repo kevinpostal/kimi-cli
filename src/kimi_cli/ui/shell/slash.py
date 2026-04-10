@@ -17,7 +17,6 @@ from kimi_cli.ui.shell.console import console
 from kimi_cli.ui.shell.mcp_status import render_mcp_console
 from kimi_cli.ui.shell.task_browser import TaskBrowserApp
 from kimi_cli.utils.changelog import CHANGELOG
-from kimi_cli.utils.datetime import format_relative_time
 from kimi_cli.utils.slashcmd import SlashCommand, SlashCommandRegistry
 
 if TYPE_CHECKING:
@@ -512,44 +511,60 @@ async def new(app: Shell, args: str):
     raise Reload(session_id=session.id)
 
 
+@registry.command(name="title", aliases=["rename"])
+async def title(app: Shell, args: str):
+    """Set or show the session title"""
+    soul = ensure_kimi_soul(app)
+    if soul is None:
+        return
+    session = soul.runtime.session
+    if not args.strip():
+        console.print(f"Session title: [bold]{session.title}[/bold]")
+        return
+
+    from kimi_cli.session_state import load_session_state, save_session_state
+
+    new_title = args.strip()[:200]
+    # Read-modify-write: load fresh state to avoid overwriting concurrent web changes
+    fresh = load_session_state(session.dir)
+    fresh.custom_title = new_title
+    fresh.title_generated = True
+    save_session_state(fresh, session.dir)
+    session.state.custom_title = new_title
+    session.state.title_generated = True
+    session.title = new_title
+    console.print(f"[green]Session title set to: {new_title}[/green]")
+
+
 @registry.command(name="sessions", aliases=["resume"])
 async def list_sessions(app: Shell, args: str):
     """List sessions and resume optionally"""
+    import shlex
+
+    from kimi_cli.ui.shell.session_picker import SessionPickerApp
+
     soul = ensure_kimi_soul(app)
     if soul is None:
         return
 
-    work_dir = soul.runtime.session.work_dir
     current_session = soul.runtime.session
-    current_session_id = current_session.id
-    sessions = [
-        session for session in await Session.list(work_dir) if session.id != current_session_id
-    ]
+    result = await SessionPickerApp(
+        work_dir=current_session.work_dir,
+        current_session=current_session,
+    ).run()
 
-    await current_session.refresh()
-    sessions.insert(0, current_session)
-
-    choices: list[tuple[str, str]] = []
-    for session in sessions:
-        time_str = format_relative_time(session.updated_at)
-        marker = " (current)" if session.id == current_session_id else ""
-        label = f"{session.title}, {time_str}{marker}"
-        choices.append((session.id, label))
-
-    try:
-        selection = await ChoiceInput(
-            message="Select a session to switch to (↑↓ navigate, Enter select, Ctrl+C cancel):",
-            options=choices,
-            default=choices[0][0],
-        ).prompt_async()
-    except (EOFError, KeyboardInterrupt):
+    if result is None:
         return
 
-    if not selection:
-        return
+    selection, selected_work_dir = result
 
-    if selection == current_session_id:
+    if selection == current_session.id:
         console.print("[yellow]You are already in this session.[/yellow]")
+        return
+
+    if selected_work_dir != current_session.work_dir:
+        cmd = f"kimi --work-dir {shlex.quote(str(selected_work_dir))} --session {selection}"
+        console.print(f"[yellow]Session is in a different directory. Run:[/yellow]\n  {cmd}")
         return
 
     console.print(f"[green]Switching to session {selection}...[/green]")
@@ -571,6 +586,53 @@ async def task(app: Shell, args: str):
         return
 
     await TaskBrowserApp(soul).run()
+
+
+@registry.command
+@shell_mode_registry.command
+def theme(app: Shell, args: str):
+    """Switch terminal color theme (dark/light)"""
+    from kimi_cli.ui.theme import get_active_theme
+
+    soul = ensure_kimi_soul(app)
+    if soul is None:
+        return
+
+    current = get_active_theme()
+    arg = args.strip().lower()
+
+    if not arg:
+        console.print(f"Current theme: [bold]{current}[/bold]")
+        console.print("[grey50]Usage: /theme dark | /theme light[/grey50]")
+        return
+
+    if arg not in ("dark", "light"):
+        console.print(f"[red]Unknown theme: {arg}. Use 'dark' or 'light'.[/red]")
+        return
+
+    if arg == current:
+        console.print(f"[yellow]Already using {arg} theme.[/yellow]")
+        return
+
+    config_file = soul.runtime.config.source_file
+    if config_file is None:
+        console.print(
+            "[yellow]Theme switching requires a config file; "
+            "restart without --config to persist this setting.[/yellow]"
+        )
+        return
+
+    # Persist to disk first — only update in-memory state after success
+    try:
+        config_for_save = load_config(config_file)
+        config_for_save.theme = arg  # type: ignore[assignment]
+        save_config(config_for_save, config_file)
+    except (ConfigError, OSError) as exc:
+        console.print(f"[red]Failed to save config: {exc}[/red]")
+        return
+
+    console.print(f"[green]Switched to {arg} theme. Reloading...[/green]")
+    raise Reload(session_id=soul.runtime.session.id)
 
 
 @registry.command
@@ -628,6 +690,123 @@ async def mcp(app: Shell, args: str):
         snapshot = soul.status.mcp_status
         if snapshot is not None:
             live.update(render_mcp_console(snapshot), refresh=True)
+
+
+@registry.command
+@shell_mode_registry.command
+def hooks(app: Shell, args: str):
+    """List configured hooks"""
+    soul = ensure_kimi_soul(app)
+    if soul is None:
+        return
+
+    engine = soul.hook_engine
+    if not engine.summary:
+        console.print(
+            "[yellow]No hooks configured. "
+            "Add [[hooks]] sections to your config.toml to set up hooks.[/yellow]"
+        )
+        return
+
+    console.print()
+    console.print("[bold]Configured Hooks:[/bold]")
+    console.print()
+
+    for event, entries in engine.details().items():
+        console.print(f"  [cyan]{event}[/cyan]: {len(entries)} hook(s)")
+        for entry in entries:
+            source_tag = f" [dim]({entry['source']})[/dim]" if entry["source"] == "wire" else ""
+            console.print(f"    [dim]{entry['matcher']}[/dim] {entry['command']}{source_tag}")
+
+    console.print()
+
+
+@registry.command
+async def undo(app: Shell, args: str):
+    """Undo: fork the session at a previous turn and retry"""
+    from kimi_cli.session_fork import enumerate_turns, fork_session
+    from kimi_cli.utils.string import shorten
+
+    soul = ensure_kimi_soul(app)
+    if soul is None:
+        return
+
+    session = soul.runtime.session
+    wire_path = session.dir / "wire.jsonl"
+    turns = enumerate_turns(wire_path)
+
+    if not turns:
+        console.print("[yellow]No turns found in this session.[/yellow]")
+        return
+
+    # Build choices: each turn's first line, truncated
+    choices: list[tuple[str, str]] = []
+    for turn in turns:
+        first_line = turn.user_text.split("\n", 1)[0]
+        label = shorten(first_line, width=80, placeholder="...")
+        choices.append((str(turn.index), f"[{turn.index}] {label}"))
+
+    try:
+        selected = await ChoiceInput(
+            message="Select a turn to undo (↑↓ navigate, Enter select, Ctrl+C cancel):",
+            options=choices,
+            default=choices[-1][0],
+        ).prompt_async()
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    turn_index = int(selected)
+
+    # The selected turn is the one we want to redo — fork includes turns *before* it
+    selected_turn = turns[turn_index]
+    user_text = selected_turn.user_text
+
+    if turn_index == 0:
+        # Fork with no history — just the user text
+        new_session = await Session.create(session.work_dir)
+        new_session_id = new_session.id
+        # Set title to match the convention used by fork_session
+        from kimi_cli.session_state import load_session_state, save_session_state
+
+        new_state = load_session_state(new_session.dir)
+        new_state.custom_title = f"Undo: {session.title}"
+        new_state.title_generated = True
+        save_session_state(new_state, new_session.dir)
+    else:
+        # Fork includes turns 0..turn_index-1
+        fork_turn_index = turn_index - 1
+        new_session_id = await fork_session(
+            source_session_dir=session.dir,
+            work_dir=session.work_dir,
+            turn_index=fork_turn_index,
+            title_prefix="Undo",
+            source_title=session.title,
+        )
+
+    console.print(f"[green]Forked at turn {turn_index}. Switching to new session...[/green]")
+    raise Reload(session_id=new_session_id, prefill_text=user_text)
+
+
+@registry.command
+async def fork(app: Shell, args: str):
+    """Fork the current session (copy all history to a new session)"""
+    from kimi_cli.session_fork import fork_session
+
+    soul = ensure_kimi_soul(app)
+    if soul is None:
+        return
+
+    session = soul.runtime.session
+    new_session_id = await fork_session(
+        source_session_dir=session.dir,
+        work_dir=session.work_dir,
+        turn_index=None,
+        title_prefix="Fork",
+        source_title=session.title,
+    )
+
+    console.print("[green]Session forked. Switching to new session...[/green]")
+    raise Reload(session_id=new_session_id)
 
 
 @registry.command

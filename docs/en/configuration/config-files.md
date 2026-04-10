@@ -27,7 +27,10 @@ The configuration file contains the following top-level configuration items:
 | `default_model` | `string` | Default model name, must be a model defined in `models` |
 | `default_thinking` | `boolean` | Whether to enable thinking mode by default (defaults to `false`) |
 | `default_yolo` | `boolean` | Whether to enable YOLO (auto-approve) mode by default (defaults to `false`) |
+| `default_plan_mode` | `boolean` | Whether to start new sessions in plan mode by default (defaults to `false`); resumed sessions preserve their existing state |
 | `default_editor` | `string` | Default external editor command (e.g. `"vim"`, `"code --wait"`), auto-detects when empty |
+| `theme` | `string` | Terminal color theme, either `"dark"` or `"light"` (defaults to `"dark"`) |
+| `merge_all_available_skills` | `boolean` | Whether to merge skills from all brand directories (defaults to `false`); see [Skills configuration](../customization/skills.md) |
 | `providers` | `table` | API provider configuration |
 | `models` | `table` | Model configuration |
 | `loop_control` | `table` | Agent loop control parameters |
@@ -41,7 +44,10 @@ The configuration file contains the following top-level configuration items:
 default_model = "kimi-for-coding"
 default_thinking = false
 default_yolo = false
+default_plan_mode = false
 default_editor = ""
+theme = "dark"
+merge_all_available_skills = false
 
 [providers.kimi-for-coding]
 type = "kimi"
@@ -63,6 +69,7 @@ compaction_trigger_ratio = 0.85
 [background]
 max_running_tasks = 4
 keep_alive_on_exit = false
+agent_task_timeout_s = 900
 
 [services.moonshot_search]
 base_url = "https://api.kimi.com/coding/v1/search"
@@ -133,12 +140,13 @@ capabilities = ["thinking", "image_in"]
 
 ### `background`
 
-`background` controls background task runtime behavior. Background tasks are launched via the `Shell` tool with `run_in_background=true`.
+`background` controls background task runtime behavior. Background tasks are launched via the `Shell` tool or the `Agent` tool with `run_in_background=true`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `max_running_tasks` | `integer` | `4` | Maximum number of concurrent background tasks |
 | `keep_alive_on_exit` | `boolean` | `false` | Whether to keep background tasks running when CLI exits; default is to terminate all background tasks on exit |
+| `agent_task_timeout_s` | `integer` | `900` | Maximum runtime in seconds for a background agent task; timed-out tasks are marked as failed and the main agent is notified |
 
 ### `services`
 
@@ -204,7 +212,6 @@ command = "prettier --write"
 | `timeout` | `integer` | No | Timeout in seconds, default 30 |
 
 *Either `command` or `inject_prompt` must be specified, but not both. When using `inject_prompt`, the content is injected into the conversation context as a system reminder without executing a shell command.
-
 ## JSON configuration migration
 
 If `~/.kimi/config.toml` doesn't exist but `~/.kimi/config.json` exists, Kimi Code CLI will automatically migrate the JSON configuration to TOML format and backup the original file as `config.json.bak`.

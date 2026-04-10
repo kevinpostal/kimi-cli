@@ -33,6 +33,17 @@ if TYPE_CHECKING:
     from fastmcp.mcp_config import MCPConfig
 
 
+def _patch_session_id(record: dict[str, Any]) -> None:
+    """Inject the current session ID (from ContextVar) into log records."""
+    try:
+        from kimi_cli.soul.toolset import get_session_id
+
+        sid = get_session_id()
+        record["extra"]["sid"] = sid if sid else ""
+    except Exception:
+        record["extra"].setdefault("sid", "")
+
+
 def enable_logging(debug: bool = False, *, redirect_stderr: bool = True) -> None:
     # NOTE: stderr redirection is implemented by swapping the process-level fd=2 (dup2).
     # That can hide Click/Typer error output during CLI startup, so some entrypoints delay
@@ -45,9 +56,14 @@ def enable_logging(debug: bool = False, *, redirect_stderr: bool = True) -> None
         get_share_dir() / "logs" / "kimi.log",
         # FIXME: configure level for different modules
         level="TRACE" if debug else "INFO",
+        format=(
+            "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
+            "{name}:{function}:{line} | {extra[sid]} - {message}"
+        ),
         rotation="06:00",
         retention="10 days",
     )
+    logger.configure(extra={"sid": ""}, patcher=_patch_session_id)
     if redirect_stderr:
         redirect_stderr_to_logger()
 
@@ -81,6 +97,8 @@ class KimiCLI:
         thinking: bool | None = None,
         # Run mode
         yolo: bool = False,
+        plan_mode: bool = False,
+        resumed: bool = False,
         # Extensions
         agent_file: Path | None = None,
         mcp_configs: list[MCPConfig] | list[dict[str, Any]] | None = None,
@@ -171,6 +189,10 @@ class KimiCLI:
         # determine yolo mode
         yolo = yolo if yolo else config.default_yolo
 
+        # determine plan mode (only for new sessions, not restored)
+        if not resumed:
+            plan_mode = plan_mode if plan_mode else config.default_plan_mode
+
         llm = create_llm(
             provider,
             model,
@@ -243,6 +265,12 @@ class KimiCLI:
         soul.set_hook_engine(hook_engine)
         runtime.hook_engine = hook_engine
 
+        # Activate plan mode if requested (for new sessions or --plan flag)
+        if plan_mode and not soul.plan_mode:
+            await soul.set_plan_mode_from_manual(True)
+        elif plan_mode and soul.plan_mode:
+            # Already in plan mode from restored session, trigger activation reminder
+            soul.schedule_plan_activation_reminder()
         return KimiCLI(soul, runtime, env_overrides)
 
     def __init__(
@@ -425,9 +453,16 @@ class KimiCLI:
                 # wait for the soul task to finish, or raise
                 await soul_task
 
-    async def run_shell(self, command: str | None = None) -> bool:
+    async def run_shell(
+        self, command: str | None = None, *, prefill_text: str | None = None
+    ) -> bool:
         """Run the Kimi Code CLI instance with shell UI."""
         from kimi_cli.ui.shell import Shell, WelcomeInfoItem
+
+        if command is None:
+            from kimi_cli.ui.shell.update import check_update_gate
+
+            check_update_gate()
 
         welcome_info = [
             WelcomeInfoItem(
@@ -499,7 +534,7 @@ class KimiCLI:
             )
         )
         async with self._env():
-            shell = Shell(self._soul, welcome_info=welcome_info)
+            shell = Shell(self._soul, welcome_info=welcome_info, prefill_text=prefill_text)
             return await shell.run(command)
 
     async def run_print(

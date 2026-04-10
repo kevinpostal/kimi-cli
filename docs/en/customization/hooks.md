@@ -90,7 +90,6 @@ For simple use cases where you just want to inject static text or file content i
 - **Relative paths**: Resolved relative to current working directory
 
 The content is injected as a system reminder message before processing each matching user prompt.
-
 ### Configuration Fields
 
 | Field | Required | Default | Description |
@@ -102,7 +101,6 @@ The content is injected as a system reminder message before processing each matc
 | `timeout` | No | `30` | Timeout in seconds, fail-open on timeout |
 
 *Either `command` or `inject_prompt` must be specified, but not both.
-
 ## Communication Protocol
 
 ### Input (Standard Input)
@@ -161,7 +159,6 @@ This is useful for:
 - Reminding the AI of coding standards
 
 When using `inject_prompt` (instead of `command`), the content is automatically injected without needing to return JSON.
-
 ## Hook Script Examples
 
 ### Protect Sensitive Files

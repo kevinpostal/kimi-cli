@@ -27,7 +27,10 @@ kimi --config '{"default_model": "kimi-for-coding", "providers": {...}, "models"
 | `default_model` | `string` | 默认使用的模型名称，必须是 `models` 中定义的模型 |
 | `default_thinking` | `boolean` | 默认是否开启 Thinking 模式（默认为 `false`） |
 | `default_yolo` | `boolean` | 默认是否开启 YOLO（自动审批）模式（默认为 `false`） |
+| `default_plan_mode` | `boolean` | 默认是否以计划模式启动新会话（默认为 `false`）；恢复的会话保留其原有状态 |
 | `default_editor` | `string` | 默认外部编辑器命令（如 `"vim"`、`"code --wait"`），为空时自动检测 |
+| `theme` | `string` | 终端配色主题，可选 `"dark"` 或 `"light"`（默认为 `"dark"`） |
+| `merge_all_available_skills` | `boolean` | 是否合并所有品牌目录中的 Skills（默认为 `false`）；详见 [Skills 配置](../customization/skills.md) |
 | `providers` | `table` | API 供应商配置 |
 | `models` | `table` | 模型配置 |
 | `loop_control` | `table` | Agent 循环控制参数 |
@@ -41,7 +44,10 @@ kimi --config '{"default_model": "kimi-for-coding", "providers": {...}, "models"
 default_model = "kimi-for-coding"
 default_thinking = false
 default_yolo = false
+default_plan_mode = false
 default_editor = ""
+theme = "dark"
+merge_all_available_skills = false
 
 [providers.kimi-for-coding]
 type = "kimi"
@@ -63,6 +69,7 @@ compaction_trigger_ratio = 0.85
 [background]
 max_running_tasks = 4
 keep_alive_on_exit = false
+agent_task_timeout_s = 900
 
 [services.moonshot_search]
 base_url = "https://api.kimi.com/coding/v1/search"
@@ -133,12 +140,13 @@ capabilities = ["thinking", "image_in"]
 
 ### `background`
 
-`background` 控制后台任务的运行行为。后台任务通过 `Shell` 工具的 `run_in_background=true` 参数启动。
+`background` 控制后台任务的运行行为。后台任务通过 `Shell` 工具的 `run_in_background=true` 或 `Agent` 工具的 `run_in_background=true` 参数启动。
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `max_running_tasks` | `integer` | `4` | 同时运行的最大后台任务数 |
 | `keep_alive_on_exit` | `boolean` | `false` | CLI 退出时是否保留后台任务运行；默认退出时终止所有后台任务 |
+| `agent_task_timeout_s` | `integer` | `900` | 后台 Agent 任务的最大运行时间（秒）；超时后任务标记为失败并通知主 Agent |
 
 ### `services`
 
@@ -204,7 +212,6 @@ command = "prettier --write"
 | `timeout` | `integer` | 否 | 超时时间（秒），默认 30 |
 
 *必须指定 `command` 或 `inject_prompt` 其中之一，但不能同时指定。使用 `inject_prompt` 时，内容会作为系统提醒注入对话上下文，无需执行 shell 命令。
-
 ## JSON 配置迁移
 
 如果 `~/.kimi/config.toml` 不存在但 `~/.kimi/config.json` 存在，Kimi Code CLI 会自动将 JSON 配置迁移到 TOML 格式，并将原文件备份为 `config.json.bak`。

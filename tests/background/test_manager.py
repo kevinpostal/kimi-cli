@@ -33,7 +33,7 @@ def test_create_bash_task_persists_starting_state(runtime, monkeypatch):
         cwd=str(runtime.session.work_dir),
     )
 
-    assert view.spec.id.startswith("b")
+    assert view.spec.id.startswith("bash-")
     assert view.runtime.status == "starting"
     assert view.runtime.worker_pid == 4242
 
@@ -157,7 +157,7 @@ async def test_create_agent_task_persists_starting_state(runtime, monkeypatch):
         model_override=None,
     )
 
-    assert view.spec.id.startswith("a")
+    assert view.spec.id.startswith("agent-")
     assert view.spec.kind == "agent"
     assert view.runtime.status == "starting"
     assert view.spec.kind_payload["agent_id"] == "a1234567"
@@ -808,6 +808,35 @@ def test_reconcile_recovers_and_publishes_lost_notification(runtime):
     published = manager.reconcile(limit=4)
 
     assert len(published) == 1
+    notification = runtime.notifications.store.merged_view(published[0])
+    assert notification.event.type == "task.lost"
+    assert notification.event.source_id == spec.id
+
+
+def test_reconcile_marks_task_lost_when_runtime_json_is_corrupted(runtime):
+    manager = runtime.background_tasks
+    store = manager.store
+    spec = TaskSpec(
+        id="b2222226",
+        kind="bash",
+        session_id=runtime.session.id,
+        description="corrupted runtime task",
+        tool_call_id="tool-3e",
+        created_at=time.time() - 60,
+        command="sleep 10",
+        shell_name="bash",
+        shell_path="/bin/bash",
+        cwd=str(runtime.session.work_dir),
+        timeout_s=60,
+    )
+    store.create_task(spec)
+    store.runtime_path(spec.id).write_text('{"status":"running"', encoding="utf-8")
+
+    published = manager.reconcile(limit=4)
+
+    assert len(published) == 1
+    recovered = store.merged_view(spec.id)
+    assert recovered.runtime.status == "lost"
     notification = runtime.notifications.store.merged_view(published[0])
     assert notification.event.type == "task.lost"
     assert notification.event.source_id == spec.id

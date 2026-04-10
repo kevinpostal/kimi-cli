@@ -60,16 +60,9 @@ async def test_additional_context_from_json():
 
 
 @pytest.mark.asyncio
-async def test_deny_clears_additional_context():
-    cmd = """echo '{"hookSpecificOutput": {"permissionDecision": "deny", "permissionDecisionReason": "blocked", "additionalContext": "should be ignored"}}' """
-    result = await run_hook(cmd, {"tool_name": "Shell"}, timeout=5)
-    assert result.action == "block"
-    assert result.additional_context == ""
-
-
-@pytest.mark.asyncio
 async def test_additional_context_with_deny():
     cmd = """echo '{"hookSpecificOutput": {"additionalContext": "skill content", "permissionDecision": "deny"}}' """
     result = await run_hook(cmd, {"tool_name": "Shell"}, timeout=5)
     assert result.action == "block"
     assert result.additional_context == ""
+
