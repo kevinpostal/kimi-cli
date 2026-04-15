@@ -65,6 +65,10 @@ else
         echo "✓ Merged upstream/main and bumped version to $NEW_VER"
         echo "✓ Tagged: $TAG_NAME"
         echo ""
+        echo "==> Reinstalling local kimi-cli..."
+        uv tool install --reinstall .
+        echo "✓ Reinstalled kimi-cli"
+        echo ""
         echo "Next step: git push origin $FOR_BRANCH --tags"
     else
         echo "Skipped merge."
