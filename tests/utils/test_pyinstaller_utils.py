@@ -34,32 +34,32 @@ def test_pyinstaller_datas():
             "dateparser/data",
         ),
         (
-            f"{site_packages}/fastmcp/../fastmcp-2.12.5.dist-info/INSTALLER",
-            "fastmcp/../fastmcp-2.12.5.dist-info",
+            f"{site_packages}/fastmcp/../fastmcp-3.2.4.dist-info/INSTALLER",
+            "fastmcp/../fastmcp-3.2.4.dist-info",
         ),
         (
-            f"{site_packages}/fastmcp/../fastmcp-2.12.5.dist-info/METADATA",
-            "fastmcp/../fastmcp-2.12.5.dist-info",
+            f"{site_packages}/fastmcp/../fastmcp-3.2.4.dist-info/METADATA",
+            "fastmcp/../fastmcp-3.2.4.dist-info",
         ),
         (
-            f"{site_packages}/fastmcp/../fastmcp-2.12.5.dist-info/RECORD",
-            "fastmcp/../fastmcp-2.12.5.dist-info",
+            f"{site_packages}/fastmcp/../fastmcp-3.2.4.dist-info/RECORD",
+            "fastmcp/../fastmcp-3.2.4.dist-info",
         ),
         (
-            f"{site_packages}/fastmcp/../fastmcp-2.12.5.dist-info/REQUESTED",
-            "fastmcp/../fastmcp-2.12.5.dist-info",
+            f"{site_packages}/fastmcp/../fastmcp-3.2.4.dist-info/REQUESTED",
+            "fastmcp/../fastmcp-3.2.4.dist-info",
         ),
         (
-            f"{site_packages}/fastmcp/../fastmcp-2.12.5.dist-info/WHEEL",
-            "fastmcp/../fastmcp-2.12.5.dist-info",
+            f"{site_packages}/fastmcp/../fastmcp-3.2.4.dist-info/WHEEL",
+            "fastmcp/../fastmcp-3.2.4.dist-info",
         ),
         (
-            f"{site_packages}/fastmcp/../fastmcp-2.12.5.dist-info/entry_points.txt",
-            "fastmcp/../fastmcp-2.12.5.dist-info",
+            f"{site_packages}/fastmcp/../fastmcp-3.2.4.dist-info/entry_points.txt",
+            "fastmcp/../fastmcp-3.2.4.dist-info",
         ),
         (
-            f"{site_packages}/fastmcp/../fastmcp-2.12.5.dist-info/licenses/LICENSE",
-            "fastmcp/../fastmcp-2.12.5.dist-info/licenses",
+            f"{site_packages}/fastmcp/../fastmcp-3.2.4.dist-info/licenses/LICENSE",
+            "fastmcp/../fastmcp-3.2.4.dist-info/licenses",
         ),
         (
             "src/kimi_cli/CHANGELOG.md",
@@ -117,7 +117,6 @@ def test_pyinstaller_datas():
         ("src/kimi_cli/tools/plan/description.md", "kimi_cli/tools/plan"),
         ("src/kimi_cli/tools/plan/enter_description.md", "kimi_cli/tools/plan"),
         ("src/kimi_cli/tools/shell/bash.md", "kimi_cli/tools/shell"),
-        ("src/kimi_cli/tools/shell/powershell.md", "kimi_cli/tools/shell"),
         (
             "src/kimi_cli/tools/think/think.md",
             "kimi_cli/tools/think",
@@ -146,6 +145,7 @@ def test_pyinstaller_hiddenimports():
 
     assert sorted(hiddenimports) == snapshot(
         [
+            "kimi_cli._build_info",
             "kimi_cli.cli.export",
             "kimi_cli.cli.info",
             "kimi_cli.cli.mcp",

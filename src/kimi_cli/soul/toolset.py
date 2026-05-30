@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import importlib
 import inspect
 import json
@@ -10,7 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 from kosong.tooling import (
     CallableTool,
@@ -92,12 +93,92 @@ def get_current_tool_call_or_none() -> ToolCall | None:
 
 
 type ToolType = CallableTool | CallableTool2[Any]
+type ToolCallKey = tuple[str, str]
 
 
 if TYPE_CHECKING:
 
     def type_check(kimi_toolset: KimiToolset):
         _: Toolset = kimi_toolset
+
+
+_REMINDER_TEXT_1 = (
+    "\n\n<system-reminder>\n"
+    "You are repeating the exact same tool call with identical parameters."
+    " Please carefully analyze the previous result. If the task is not yet complete,"
+    " try a different method or parameters instead of repeating the same call."
+    "\n</system-reminder>"
+)
+
+
+def _make_reminder_text_2(tool_name: str, repeat_count: int, canonical_args: str) -> str:
+    return (
+        "\n\n<system-reminder>\n"
+        "You have repeatedly called the same tool with identical parameters many times.\n"
+        "Repeated tool call detected:\n"
+        f"- tool: {tool_name}\n"
+        f"- repeated_times: {repeat_count}\n"
+        f"- arguments: {canonical_args}\n"
+        "The previous repeated calls did not make progress. Do not call this exact same tool "
+        "with the exact same arguments again.\n"
+        "Carefully inspect the latest tool result and choose a different next action, "
+        "different parameters, or finish the task if enough evidence has been gathered."
+        "\n</system-reminder>"
+    )
+
+
+def _sort_json_value(value: object) -> object:
+    if isinstance(value, list):
+        return [_sort_json_value(item) for item in cast("list[object]", value)]
+    if isinstance(value, dict):
+        value_dict = cast("dict[str, object]", value)
+        return {key: _sort_json_value(value_dict[key]) for key in sorted(value_dict)}
+    return value
+
+
+def _canonical_tool_arguments(arguments: Any) -> str:
+    try:
+        return json.dumps(
+            _sort_json_value(arguments),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return str(arguments)
+
+
+def _canonical_tool_arguments_text(arguments: str) -> str:
+    try:
+        return _canonical_tool_arguments(json.loads(arguments, strict=False))
+    except json.JSONDecodeError:
+        return arguments
+
+
+def _normalize_call_key(tool_name: str, arguments: str) -> ToolCallKey:
+    return (tool_name, _canonical_tool_arguments_text(arguments))
+
+
+def _append_reminder_to_return_value(
+    return_value: Any, reminder_text: str = _REMINDER_TEXT_1
+) -> Any:
+    """Append dedup reminder text to a ToolReturnValue output."""
+    from kosong.tooling import ToolReturnValue
+
+    if not isinstance(return_value, ToolReturnValue):
+        return return_value
+
+    output = return_value.output
+
+    if isinstance(output, str):
+        new_output = output + reminder_text
+    else:
+        new_output = list(output)
+        if new_output and isinstance(new_output[-1], TextPart):
+            new_output[-1] = TextPart(text=new_output[-1].text + reminder_text)
+        else:
+            new_output.append(TextPart(text=reminder_text))
+
+    return return_value.model_copy(update={"output": new_output})
 
 
 class KimiToolset:
@@ -108,6 +189,18 @@ class KimiToolset:
         self._mcp_loading_task: asyncio.Task[None] | None = None
         self._deferred_mcp_load: tuple[list[MCPConfig], Runtime] | None = None
         self._hook_engine: HookEngine = HookEngine()
+
+        # Deduplication state
+        self._previous_step_calls: list[ToolCallKey] = []
+        self._current_step_calls: list[ToolCallKey] = []
+        self._current_step_tasks: dict[ToolCallKey, asyncio.Task[ToolResult]] = {}
+        self._seen_call_keys: set[ToolCallKey] = set()
+        self._consecutive_key: ToolCallKey | None = None
+        self._consecutive_count: int = 0
+        self._step_closed: bool = False
+        self._dedup_triggered: bool = False
+        self._step_no: int = 0
+        self._turn_id: str = ""
 
     def set_hook_engine(self, engine: HookEngine) -> None:
         self._hook_engine = engine
@@ -145,27 +238,137 @@ class KimiToolset:
             tool.base for tool in self._tool_dict.values() if tool.name not in self._hidden_tools
         ]
 
+    def begin_step(
+        self,
+        previous_calls: list[tuple[str, str]],
+        *,
+        step_no: int = 0,
+        turn_id: str = "",
+    ) -> None:
+        """Called before each step to set up deduplication state."""
+        self._previous_step_calls = [
+            _normalize_call_key(tool_name, arguments) for tool_name, arguments in previous_calls
+        ]
+        self._current_step_calls = []
+        self._current_step_tasks = {}
+        self._step_closed = False
+        self._dedup_triggered = False
+        self._step_no = step_no
+        self._turn_id = turn_id
+        if not self._previous_step_calls:
+            self._seen_call_keys = set()
+            self._consecutive_key = None
+            self._consecutive_count = 0
+        else:
+            self._seen_call_keys.update(self._previous_step_calls)
+            if self._consecutive_key is None and self._consecutive_count == 0:
+                self._advance_consecutive_streak(self._previous_step_calls)
+
+    def end_step(self) -> list[tuple[str, str]]:
+        """Called after each step to capture the calls made in this step."""
+        if not self._step_closed:
+            self._advance_consecutive_streak(self._current_step_calls)
+            self._seen_call_keys.update(self._current_step_calls)
+            self._step_closed = True
+        return list(self._current_step_calls)
+
+    def _advance_consecutive_streak(self, calls: list[ToolCallKey]) -> None:
+        for call_key in calls:
+            if call_key == self._consecutive_key:
+                self._consecutive_count += 1
+            else:
+                self._consecutive_key = call_key
+                self._consecutive_count = 1
+
+    def _projected_streak_for_call(self, call_index: int) -> int:
+        consecutive_key = self._consecutive_key
+        consecutive_count = self._consecutive_count
+        for call_key in self._current_step_calls[: call_index + 1]:
+            if call_key == consecutive_key:
+                consecutive_count += 1
+            else:
+                consecutive_key = call_key
+                consecutive_count = 1
+        return consecutive_count
+
+    @property
+    def dedup_triggered(self) -> bool:
+        """Whether a cross-step duplicate was blocked in the current step."""
+        return self._dedup_triggered
+
     def handle(self, tool_call: ToolCall) -> HandleResult:
         token = current_tool_call.set(tool_call)
         try:
-            if tool_call.function.name not in self._tool_dict:
+            tool_name = tool_call.function.name
+
+            if tool_name not in self._tool_dict:
                 return ToolResult(
                     tool_call_id=tool_call.id,
-                    return_value=ToolNotFoundError(tool_call.function.name),
+                    return_value=ToolNotFoundError(tool_name),
                 )
-
-            tool = self._tool_dict[tool_call.function.name]
 
             try:
                 arguments: JsonType = json.loads(tool_call.function.arguments or "{}", strict=False)
             except json.JSONDecodeError as e:
                 logger.warning(
                     "Tool call JSON parse error: {tool_name} (call_id={call_id}): {error}",
-                    tool_name=tool_call.function.name,
+                    tool_name=tool_name,
                     call_id=tool_call.id,
                     error=e,
                 )
                 return ToolResult(tool_call_id=tool_call.id, return_value=ToolParseError(str(e)))
+
+            canonical_args = _canonical_tool_arguments(arguments)
+            call_key = (tool_name, canonical_args)
+            call_index = len(self._current_step_calls)
+            self._current_step_calls.append(call_key)
+
+            # Same-step dedup: wait for the original task and copy its result.
+            if call_key in self._current_step_tasks:
+                from kimi_cli.telemetry import track
+
+                track(
+                    "tool_call_dedup_detected",
+                    session_id=_get_session_id(),
+                    turn_id=self._turn_id,
+                    step_no=self._step_no,
+                    tool_name=tool_name,
+                    dup_type="same_step",
+                    args_hash=hashlib.sha256(canonical_args.encode()).hexdigest()[:8],
+                )
+                original_task = self._current_step_tasks[call_key]
+
+                async def _await_dup() -> ToolResult:
+                    original_result = await original_task
+                    return ToolResult(
+                        tool_call_id=tool_call.id,
+                        return_value=original_result.return_value,
+                    )
+
+                return asyncio.create_task(_await_dup())
+
+            is_cross_step_dup = call_key in self._seen_call_keys
+            reminder_text: str | None = None
+            if is_cross_step_dup:
+                from kimi_cli.telemetry import track
+
+                track(
+                    "tool_call_dedup_detected",
+                    session_id=_get_session_id(),
+                    turn_id=self._turn_id,
+                    step_no=self._step_no,
+                    tool_name=tool_name,
+                    dup_type="cross_step",
+                    args_hash=hashlib.sha256(canonical_args.encode()).hexdigest()[:8],
+                )
+                self._dedup_triggered = True
+                repeat_count = self._projected_streak_for_call(call_index)
+                if repeat_count == 3:
+                    reminder_text = _REMINDER_TEXT_1
+                elif repeat_count in (5, 8):
+                    reminder_text = _make_reminder_text_2(tool_name, repeat_count, canonical_args)
+
+            tool = self._tool_dict[tool_name]
 
             async def _call():
                 tool_input_dict = arguments if isinstance(arguments, dict) else {}
@@ -175,11 +378,11 @@ class KimiToolset:
 
                 results = await self._hook_engine.trigger(
                     "PreToolUse",
-                    matcher_value=tool_call.function.name,
+                    matcher_value=tool_name,
                     input_data=events.pre_tool_use(
                         session_id=_get_session_id(),
                         cwd=str(Path.cwd()),
-                        tool_name=tool_call.function.name,
+                        tool_name=tool_name,
                         tool_input=tool_input_dict,
                         tool_call_id=tool_call.id,
                     ),
@@ -202,18 +405,18 @@ class KimiToolset:
                     tool_elapsed = time.monotonic() - t0
                     logger.exception(
                         "Tool execution failed: {tool_name} (call_id={call_id})",
-                        tool_name=tool_call.function.name,
+                        tool_name=tool_name,
                         call_id=tool_call.id,
                     )
                     # --- PostToolUseFailure (fire-and-forget) ---
                     _hook_task = asyncio.create_task(
                         self._hook_engine.trigger(
                             "PostToolUseFailure",
-                            matcher_value=tool_call.function.name,
+                            matcher_value=tool_name,
                             input_data=events.post_tool_use_failure(
                                 session_id=_get_session_id(),
                                 cwd=str(Path.cwd()),
-                                tool_name=tool_call.function.name,
+                                tool_name=tool_name,
                                 tool_input=tool_input_dict,
                                 error=str(e),
                                 tool_call_id=tool_call.id,
@@ -227,14 +430,9 @@ class KimiToolset:
 
                     _error_type = type(e).__name__
                     track(
-                        "tool_error",
-                        tool_name=tool_call.function.name,
-                        error_type=_error_type,
-                    )
-                    track(
                         "tool_call",
-                        tool_name=tool_call.function.name,
-                        success=False,
+                        tool_name=tool_name,
+                        outcome="error",
                         duration_ms=int(tool_elapsed * 1000),
                         error_type=_error_type,
                     )
@@ -246,28 +444,39 @@ class KimiToolset:
                 tool_elapsed = time.monotonic() - t0
                 logger.info(
                     "Tool {tool_name} completed in {elapsed:.1f}s (call_id={call_id})",
-                    tool_name=tool_call.function.name,
+                    tool_name=tool_name,
                     elapsed=tool_elapsed,
                     call_id=tool_call.id,
                 )
                 from kimi_cli.telemetry import track as _track_tool_call
 
-                _track_tool_call(
-                    "tool_call",
-                    tool_name=tool_call.function.name,
-                    success=not isinstance(ret, ToolError),
-                    duration_ms=int(tool_elapsed * 1000),
-                )
+                if isinstance(ret, ToolError):
+                    _track_tool_call(
+                        "tool_call",
+                        tool_name=tool_name,
+                        outcome="error",
+                        duration_ms=int(tool_elapsed * 1000),
+                        error_type=type(ret).__name__,
+                        dup_type="cross_step" if is_cross_step_dup else "normal",
+                    )
+                else:
+                    _track_tool_call(
+                        "tool_call",
+                        tool_name=tool_name,
+                        outcome="success",
+                        duration_ms=int(tool_elapsed * 1000),
+                        dup_type="cross_step" if is_cross_step_dup else "normal",
+                    )
 
                 # --- PostToolUse (fire-and-forget) ---
                 _hook_task = asyncio.create_task(
                     self._hook_engine.trigger(
                         "PostToolUse",
-                        matcher_value=tool_call.function.name,
+                        matcher_value=tool_name,
                         input_data=events.post_tool_use(
                             session_id=_get_session_id(),
                             cwd=str(Path.cwd()),
-                            tool_name=tool_call.function.name,
+                            tool_name=tool_name,
                             tool_input=tool_input_dict,
                             tool_output=str(ret)[:2000],
                             tool_call_id=tool_call.id,
@@ -278,7 +487,23 @@ class KimiToolset:
 
                 return ToolResult(tool_call_id=tool_call.id, return_value=ret)
 
-            return asyncio.create_task(_call())
+            task = asyncio.create_task(_call())
+            if reminder_text is not None:
+
+                async def _wrap_with_reminder(
+                    inner_task: asyncio.Task[ToolResult],
+                    text: str,
+                ) -> ToolResult:
+                    tr = await inner_task
+                    return ToolResult(
+                        tool_call_id=tr.tool_call_id,
+                        return_value=_append_reminder_to_return_value(tr.return_value, text),
+                    )
+
+                task = asyncio.create_task(_wrap_with_reminder(task, reminder_text))
+
+            self._current_step_tasks[call_key] = task
+            return task
         finally:
             current_tool_call.reset(token)
 
@@ -424,18 +649,12 @@ class KimiToolset:
         import fastmcp
         from fastmcp.mcp_config import MCPConfig, RemoteMCPServer
 
+        from kimi_cli.mcp_oauth import create_mcp_oauth, has_mcp_oauth_tokens
         from kimi_cli.ui.shell.prompt import toast
 
         async def _check_oauth_tokens(server_url: str) -> bool:
             """Check if OAuth tokens exist for the server."""
-            try:
-                from fastmcp.client.auth.oauth import FileTokenStorage
-
-                storage = FileTokenStorage(server_url=server_url)
-                tokens = await storage.get_tokens()
-                return tokens is not None
-            except Exception:
-                return False
+            return await has_mcp_oauth_tokens(server_url)
 
         def _toast_mcp(message: str) -> None:
             if in_background:
@@ -447,7 +666,15 @@ class KimiToolset:
                     position="right",
                 )
 
-        oauth_servers: dict[str, str] = {}
+        def _mark_oauth_unauthorized(server_name: str) -> None:
+            logger.warning(
+                "Skipping OAuth MCP server '{server_name}': not authorized. "
+                "Run 'kimi mcp auth {server_name}' first.",
+                server_name=server_name,
+            )
+            self._mcp_servers[server_name] = MCPServerInfo(
+                status="unauthorized", client=None, tools=[]
+            )
 
         async def _connect_server(
             server_name: str, server_info: MCPServerInfo
@@ -457,6 +684,7 @@ class KimiToolset:
 
             server_info.status = "connecting"
             try:
+                assert server_info.client is not None
                 async with server_info.client as client:
                     for tool in await client.list_tools():
                         server_info.tools.append(
@@ -480,20 +708,6 @@ class KimiToolset:
 
         async def _connect():
             _toast_mcp("connecting to mcp servers...")
-            unauthorized_servers: dict[str, str] = {}
-            for server_name, server_info in self._mcp_servers.items():
-                server_url = oauth_servers.get(server_name)
-                if not server_url:
-                    continue
-                if not await _check_oauth_tokens(server_url):
-                    logger.warning(
-                        "Skipping OAuth MCP server '{server_name}': not authorized. "
-                        "Run 'kimi mcp auth {server_name}' first.",
-                        server_name=server_name,
-                    )
-                    server_info.status = "unauthorized"
-                    unauthorized_servers[server_name] = server_url
-
             tasks = [
                 asyncio.create_task(_connect_server(server_name, server_info))
                 for server_name, server_info in self._mcp_servers.items()
@@ -511,7 +725,7 @@ class KimiToolset:
             if failed_servers:
                 _toast_mcp("mcp connection failed")
                 raise MCPRuntimeError(f"Failed to connect MCP servers: {failed_servers}")
-            if unauthorized_servers:
+            if any(info.status == "unauthorized" for info in self._mcp_servers.values()):
                 _toast_mcp("mcp authorization needed")
             else:
                 _toast_mcp("mcp servers connected")
@@ -523,7 +737,20 @@ class KimiToolset:
 
             for server_name, server_config in mcp_config.mcpServers.items():
                 if isinstance(server_config, RemoteMCPServer) and server_config.auth == "oauth":
-                    oauth_servers[server_name] = server_config.url
+                    if not await _check_oauth_tokens(server_config.url):
+                        _mark_oauth_unauthorized(server_name)
+                        continue
+                    try:
+                        auth = create_mcp_oauth(server_config.url)
+                    except Exception as e:
+                        logger.debug(
+                            "Failed to create MCP OAuth storage for {server_name}: {error}",
+                            server_name=server_name,
+                            error=e,
+                        )
+                        _mark_oauth_unauthorized(server_name)
+                        continue
+                    server_config = server_config.model_copy(update={"auth": auth})
 
                 client = fastmcp.Client(MCPConfig(mcpServers={server_name: server_config}))
                 self._mcp_servers[server_name] = MCPServerInfo(
@@ -555,16 +782,20 @@ class KimiToolset:
         self._deferred_mcp_load = None
         if self._mcp_loading_task:
             self._mcp_loading_task.cancel()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
                 await self._mcp_loading_task
         for server_info in self._mcp_servers.values():
-            await server_info.client.close()
+            if server_info.client is not None:
+                try:
+                    await server_info.client.close()
+                except Exception:
+                    logger.warning("Failed to close MCP client", exc_info=True)
 
 
 @dataclass(slots=True)
 class MCPServerInfo:
     status: Literal["pending", "connecting", "connected", "failed", "unauthorized"]
-    client: fastmcp.Client[Any]
+    client: fastmcp.Client[Any] | None
     tools: list[MCPTool[Any]]
 
 

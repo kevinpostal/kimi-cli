@@ -27,7 +27,7 @@ from kimi_cli.background import list_task_views
 from kimi_cli.llm import model_display_name
 from kimi_cli.notifications import NotificationManager, NotificationWatcher
 from kimi_cli.soul import LLMNotSet, LLMNotSupported, MaxStepsReached, RunCancelled, Soul, run_soul
-from kimi_cli.soul.kimisoul import KimiSoul
+from kimi_cli.soul.kimisoul import FLOW_COMMAND_PREFIX, KimiSoul
 from kimi_cli.ui.shell import update as _update_mod
 from kimi_cli.ui.shell.console import console
 from kimi_cli.ui.shell.echo import render_user_echo_text
@@ -41,8 +41,8 @@ from kimi_cli.ui.shell.prompt import (
     toast,
 )
 from kimi_cli.ui.shell.replay import replay_recent_history
+from kimi_cli.ui.shell.slash import SKILL_COMMAND_PREFIX, shell_mode_registry
 from kimi_cli.ui.shell.slash import registry as shell_slash_registry
-from kimi_cli.ui.shell.slash import shell_mode_registry
 from kimi_cli.ui.shell.update import LATEST_VERSION_FILE, UpdateResult, do_update, semver_tuple
 from kimi_cli.ui.shell.visualize import (
     ApprovalPromptDelegate,
@@ -75,6 +75,9 @@ _MAX_BG_AUTO_TRIGGER_FAILURES = 3
 
 _BG_AUTO_TRIGGER_INPUT_GRACE_S = 0.75
 """Delay background auto-trigger briefly after local prompt activity."""
+
+_VISIBLE_WORKFLOW_SLASH_PREFIXES = (SKILL_COMMAND_PREFIX, FLOW_COMMAND_PREFIX)
+"""Explicit skill/flow prefixes that should remain visible in transcript."""
 
 
 class _BackgroundCompletionWatcher:
@@ -197,16 +200,38 @@ class Shell:
         self._current_prompt_approval_request: ApprovalRequest | None = None
         self._approval_modal: ApprovalPromptDelegate | None = None
         self._exit_after_run = False
+        soul_slash_commands = list(soul.available_slash_commands)
+        shell_slash_commands = shell_slash_registry.list_commands()
         self._available_slash_commands: dict[str, SlashCommand[Any]] = {
-            **{cmd.name: cmd for cmd in soul.available_slash_commands},
-            **{cmd.name: cmd for cmd in shell_slash_registry.list_commands()},
+            **{cmd.name: cmd for cmd in soul_slash_commands},
+            **{cmd.name: cmd for cmd in shell_slash_commands},
         }
-        """Shell-level slash commands + soul-level slash commands. Name to command mapping."""
+        """Shell-level slash commands + soul-level slash commands. Primary name mapping."""
+        self._available_slash_command_index = self._index_slash_commands(
+            [*soul_slash_commands, *shell_slash_commands]
+        )
+        """Shell-level slash commands + soul-level slash commands.
+        Primary name and alias mapping.
+        """
 
     @property
     def available_slash_commands(self) -> dict[str, SlashCommand[Any]]:
         """Get all available slash commands, including shell-level and soul-level commands."""
         return self._available_slash_commands
+
+    @staticmethod
+    def _index_slash_commands(commands: list[SlashCommand[Any]]) -> dict[str, SlashCommand[Any]]:
+        indexed: dict[str, SlashCommand[Any]] = {}
+        for command in commands:
+            indexed[command.name] = command
+            for alias in command.aliases:
+                indexed[alias] = command
+        return indexed
+
+    def _find_available_slash_command(self, name: str) -> SlashCommand[Any] | None:
+        return self._available_slash_command_index.get(name) or self._available_slash_commands.get(
+            name
+        )
 
     def _print_cwd_lost_crash(self) -> None:
         """Print a crash report when the working directory is no longer accessible."""
@@ -256,16 +281,29 @@ class Shell:
         return resolved_call
 
     @staticmethod
-    def _should_echo_agent_input(user_input: UserInput) -> bool:
+    def _should_echo_workflow_slash_input(user_input: UserInput) -> bool:
+        command_call = Shell._agent_slash_command_call(user_input)
+        return command_call is not None and command_call.name.startswith(
+            _VISIBLE_WORKFLOW_SLASH_PREFIXES
+        )
+
+    def _should_echo_agent_input(self, user_input: UserInput) -> bool:
         if user_input.mode != PromptMode.AGENT:
             return False
         if Shell._should_exit_input(user_input):
             return False
+        # Phase 1 policy: keep operational slash commands hidden, but show
+        # explicit `/skill:*` and `/flow:*` inputs because they represent
+        # user-visible workflow intent and otherwise vanish from transcript
+        # even when the command later fails to resolve.
+        if self._should_echo_workflow_slash_input(user_input):
+            return True
         return Shell._agent_slash_command_call(user_input) is None
 
     @staticmethod
     def _echo_agent_input(user_input: UserInput) -> None:
         console.print(render_user_echo_text(user_input.command))
+        console.print()
 
     def _bind_running_input(
         self,
@@ -606,9 +644,6 @@ class Shell:
                     )
                     action = classify_input(input_text, is_streaming=False)
                     if action.kind == InputAction.BTW and isinstance(self.soul, KimiSoul):
-                        from kimi_cli.telemetry import track
-
-                        track("input_btw")
                         await self._run_btw_modal(action.args, prompt_session)
                         resume_prompt.set()
                         continue
@@ -618,14 +653,16 @@ class Shell:
                         continue
 
                     if slash_cmd_call := self._agent_slash_command_call(user_input):
+                        available_command = self._find_available_slash_command(slash_cmd_call.name)
                         is_soul_slash = (
-                            slash_cmd_call.name in self._available_slash_commands
+                            available_command is not None
                             and shell_slash_registry.find_command(slash_cmd_call.name) is None
                         )
                         if is_soul_slash:
                             from kimi_cli.telemetry import track
 
-                            track("input_command", command=slash_cmd_call.name)
+                            assert available_command is not None
+                            track("input_command", command=available_command.name)
                             background_autotrigger_armed = True
                             resume_prompt.set()
                             await self.run_soul_command(slash_cmd_call.raw_input)
@@ -739,7 +776,8 @@ class Shell:
         from kimi_cli.cli import Reload, SwitchToVis, SwitchToWeb
         from kimi_cli.telemetry import track
 
-        if command_call.name not in self._available_slash_commands:
+        available_command = self._find_available_slash_command(command_call.name)
+        if available_command is None:
             logger.info("Unknown slash command /{command}", command=command_call.name)
             track("input_command_invalid")
             console.print(
@@ -748,7 +786,7 @@ class Shell:
             )
             return
 
-        track("input_command", command=command_call.name)
+        track("input_command", command=available_command.name)
 
         command = shell_slash_registry.find_command(command_call.name)
         if command is None:
@@ -870,6 +908,7 @@ class Shell:
                     break
                 queued = pending.pop(0)
                 console.print(render_user_echo_text(queued.command))
+                console.print()
                 await run_soul(
                     self.soul,
                     queued.content,
@@ -932,10 +971,7 @@ class Shell:
                     f"[red]Membership expired, please renew your plan[/red]\n[dim]Server: {e}[/dim]"
                 )
             elif isinstance(e, APIStatusError) and e.status_code == 403:
-                console.print(
-                    "[red]Quota exceeded, please upgrade your plan or retry later[/red]\n"
-                    f"[dim]Server: {e}[/dim]"
-                )
+                console.print(f"[red]Server: {e}[/red]")
             elif isinstance(e, APIConnectionError):
                 console.print(
                     f"[red]Network connection failed: {e}[/red]\n"
@@ -967,12 +1003,6 @@ class Shell:
             )
         except RunCancelled:
             logger.info("Cancelled by user")
-            from kimi_cli.telemetry import track
-
-            _at_step = (
-                getattr(self.soul, "_current_step_no", 0) if isinstance(self.soul, KimiSoul) else 0
-            )
-            track("turn_interrupted", at_step=_at_step)
             console.print("[red]Interrupted by user[/red]")
         except Exception as e:
             logger.exception("Unexpected error:")
@@ -1445,7 +1475,7 @@ class WelcomeInfoItem:
         ERROR = "red"
 
     name: str
-    value: str
+    value: str | Text
     level: Level = Level.INFO
 
 
@@ -1465,7 +1495,10 @@ def _print_welcome_info(name: str, info_items: list[WelcomeInfoItem]) -> None:
     if info_items:
         rows.append(Text(""))  # empty line
     for item in info_items:
-        rows.append(Text(f"{item.name}: {item.value}", style=item.level.value))
+        if isinstance(item.value, Text):
+            rows.append(Text.assemble(f"{item.name}: ", item.value, style=item.level.value))
+        else:
+            rows.append(Text(f"{item.name}: {item.value}", style=item.level.value))
 
     if LATEST_VERSION_FILE.exists():
         from kimi_cli.constant import VERSION as current_version
