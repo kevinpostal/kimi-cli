@@ -926,6 +926,35 @@ async def fork(app: Shell, args: str):
     raise Reload(session_id=new_session_id)
 
 
+@registry.command
+@shell_mode_registry.command
+def hooks(app: Shell, args: str):
+    """List configured hooks"""
+    soul = ensure_kimi_soul(app)
+    if soul is None:
+        return
+
+    engine = soul.hook_engine
+    if not engine.summary:
+        console.print(
+            "[yellow]No hooks configured. "
+            "Add [[hooks]] sections to your config.toml to set up hooks.[/yellow]"
+        )
+        return
+
+    console.print()
+    console.print("[bold]Configured Hooks:[/bold]")
+    console.print()
+
+    for event, entries in engine.details().items():
+        console.print(f"  [cyan]{event}[/cyan]: {len(entries)} hook(s)")
+        for entry in entries:
+            source_tag = f" [dim]({entry['source']})[/dim]" if entry["source"] == "wire" else ""
+            console.print(f"    [dim]{entry['matcher']}[/dim] {entry['command']}{source_tag}")
+
+    console.print()
+
+
 from . import (  # noqa: E402
     debug,  # noqa: F401 # type: ignore[reportUnusedImport]
     export_import,  # noqa: F401 # type: ignore[reportUnusedImport]

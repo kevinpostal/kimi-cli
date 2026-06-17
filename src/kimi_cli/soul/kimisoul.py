@@ -616,6 +616,7 @@ class KimiSoul:
                         prompt=text_input_for_hook,
                     ),
                 )
+                additional_contexts: list[str] = []
                 for result in hook_results:
                     if result.action == "block":
                         wire_send(TurnBegin(user_input=user_input))
@@ -624,6 +625,15 @@ class KimiSoul:
                         wire_send(TurnEnd())
                         turn_finished = True
                         return
+                    if result.additional_context:
+                        additional_contexts.append(result.additional_context)
+                if additional_contexts:
+                    combined_context = "\n\n".join(additional_contexts)
+                    context_message = Message(
+                        role="user",
+                        content=[system_reminder(combined_context)],
+                    )
+                    await self._context.append_message(context_message)
 
             wire_send(TurnBegin(user_input=user_input))
             turn_started = True

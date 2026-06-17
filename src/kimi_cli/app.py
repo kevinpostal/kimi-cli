@@ -312,19 +312,19 @@ class KimiCLI:
 
         soul = KimiSoul(agent, context=context)
 
-        # Activate plan mode if requested (for new sessions or --plan flag)
-        if plan_mode and not soul.plan_mode:
-            await soul.set_plan_mode_from_manual(True)
-        elif plan_mode and soul.plan_mode:
-            # Already in plan mode from restored session, trigger activation reminder
-            soul.schedule_plan_activation_reminder()
-
         # Create and inject hook engine
         from kimi_cli.hooks.engine import HookEngine
 
         hook_engine = HookEngine(config.hooks, cwd=str(session.work_dir))
         soul.set_hook_engine(hook_engine)
         runtime.hook_engine = hook_engine
+
+        # Activate plan mode if requested (for new sessions or --plan flag)
+        if plan_mode and not soul.plan_mode:
+            await soul.set_plan_mode_from_manual(True)
+        elif plan_mode and soul.plan_mode:
+            # Already in plan mode from restored session, trigger activation reminder
+            soul.schedule_plan_activation_reminder()
 
         # --- Initialize telemetry ---
         from kimi_cli.telemetry import attach_sink, set_context

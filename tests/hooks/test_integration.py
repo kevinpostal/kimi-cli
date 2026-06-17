@@ -9,6 +9,45 @@ from kimi_cli.hooks.engine import HookEngine
 
 
 @pytest.mark.asyncio
+async def test_inject_prompt_text():
+    """inject_prompt with text content returns additional_context."""
+    hooks = [HookDef(event="UserPromptSubmit", inject_prompt="use TDD")]
+    engine = HookEngine(hooks)
+    results = await engine.trigger("UserPromptSubmit", input_data={"prompt": "hello"})
+    assert len(results) == 1
+    assert results[0].action == "allow"
+    assert results[0].additional_context == "use TDD"
+
+
+@pytest.mark.asyncio
+async def test_inject_prompt_file(tmp_path: Path):
+    """inject_prompt with file path reads file content."""
+    prompt_file = tmp_path / "reminder.md"
+    prompt_file.write_text("Always use TDD", encoding="utf-8")
+    hooks = [HookDef(event="UserPromptSubmit", inject_prompt=str(prompt_file))]
+    engine = HookEngine(hooks)
+    results = await engine.trigger("UserPromptSubmit", input_data={"prompt": "hello"})
+    assert len(results) == 1
+    assert results[0].action == "allow"
+    assert results[0].additional_context == "Always use TDD"
+
+
+@pytest.mark.asyncio
+async def test_inject_prompt_multiple():
+    """Multiple inject_prompt hooks combine all additional_context."""
+    hooks = [
+        HookDef(event="UserPromptSubmit", inject_prompt="context one"),
+        HookDef(event="UserPromptSubmit", inject_prompt="context two"),
+    ]
+    engine = HookEngine(hooks)
+    results = await engine.trigger("UserPromptSubmit", input_data={"prompt": "hello"})
+    contexts = [r.additional_context for r in results if r.additional_context]
+    assert len(contexts) == 2
+    assert "context one" in contexts
+    assert "context two" in contexts
+
+
+@pytest.mark.asyncio
 async def test_pre_tool_use_block_flow():
     """Full flow: hook blocks a dangerous command."""
     with tempfile.TemporaryDirectory() as tmpdir:

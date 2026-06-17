@@ -61,6 +61,16 @@ current_tool_call = ContextVar[ToolCall | None]("current_tool_call", default=Non
 
 _current_session_id: ContextVar[str] = ContextVar("_current_session_id", default="")
 
+_current_session_id: ContextVar[str] = ContextVar("_current_session_id", default="")
+
+
+def set_session_id(sid: str) -> None:
+    _current_session_id.set(sid)
+
+
+def _get_session_id() -> str:
+    return _current_session_id.get()
+
 
 def set_session_id(sid: str) -> None:
     _current_session_id.set(sid)

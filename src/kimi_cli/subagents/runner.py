@@ -416,6 +416,8 @@ class ForegroundSubagentRunner:
                     continue
                 if isinstance(msg, HookRequest):
                     continue
+                if isinstance(msg, HookRequest):
+                    continue
                 super_wire.soul_side.send(
                     SubagentEvent(
                         parent_tool_call_id=parent_tool_call_id,
